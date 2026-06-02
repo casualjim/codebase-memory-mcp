@@ -694,6 +694,11 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        char rust_analyzer_env[CBM_SZ_16];
+        if (cbm_safe_getenv("CBM_ENABLE_RUST_ANALYZER_LSP", rust_analyzer_env,
+                            sizeof(rust_analyzer_env), NULL) != NULL) {
+            (void)cbm_pxc_run_rust_analyzer_batch(ctx, files, file_count, cache);
+        }
     }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));

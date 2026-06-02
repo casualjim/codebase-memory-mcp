@@ -61,6 +61,7 @@ extern void suite_java_lsp(void);
 extern void suite_java_lsp_coverage(void);
 extern void suite_kotlin_lsp(void);
 extern void suite_rust_lsp(void);
+extern void suite_rust_analyzer_lsp(void);
 extern void suite_store_arch(void);
 extern void suite_store_bulk(void);
 extern void suite_store_pragmas(void);
@@ -181,6 +182,7 @@ int main(void) {
     RUN_SUITE(ts_lsp);
     RUN_SUITE(java_lsp);
     RUN_SUITE(java_lsp_coverage);
+    RUN_SUITE(rust_analyzer_lsp);
 
     /* Architecture + ADR + Louvain */
     RUN_SUITE(store_arch);

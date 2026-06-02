@@ -13,7 +13,7 @@
  * file LSP picks them up.
  *
  * Languages covered: Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/
- * TSX, PHP, C#. Anything else short-circuits via cbm_pxc_has_cross_lsp.
+ * TSX, PHP, C#, Rust. Anything else short-circuits via cbm_pxc_has_cross_lsp.
  *
  * Previously this work ran as a separate sequential pipeline pass
  * (cbm_pipeline_pass_lsp_cross) that re-read every source file from
@@ -39,6 +39,15 @@
 
 /* True iff this language has a cbm_run_X_lsp_cross resolver wired up. */
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
+
+/* Optional slow/accurate Rust resolver adapter. Default Rust resolution uses
+ * internal/cbm/lsp/rust_lsp.c; this side path maps CBM extraction rows to the
+ * rust_analyzer_lsp.h generic ABI, invokes rust_analyzer_resolve_batch per Cargo
+ * workspace root, and appends only real resolved edges into each owning CBMFileResult
+ * by caller_qn. Pipeline only runs it when CBM_ENABLE_RUST_ANALYZER_LSP is set.
+ * Direct calls remain no-op when optional rust_analyzer_lsp pkg-config dependency is absent. */
+int cbm_pxc_run_rust_analyzer_batch(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                    int file_count, CBMFileResult **cache);
 
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the

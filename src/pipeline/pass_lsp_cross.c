@@ -22,6 +22,7 @@
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/rust_lsp.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
@@ -30,6 +31,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#ifdef HAVE_RUST_ANALYZER_LSP
+#include <rust_analyzer_lsp.h>
+#endif
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
@@ -292,10 +300,27 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_CSHARP: /* tier-2 prebuilt registry path (pass_parallel.c) */
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_KOTLIN: /* fallback cbm_pxc_run_one path */
+    case CBM_LANG_RUST:
         return true;
     default:
         return false;
     }
+}
+
+static void pxc_append_result_fields(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
+                                     const char *caller_qn, const char *callee_qn,
+                                     const char *strategy, float confidence,
+                                     const char *reason) {
+    if (!dst_arena || !dst_calls || !caller_qn || !callee_qn)
+        return;
+    CBMResolvedCall dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.caller_qn = cbm_arena_strdup(dst_arena, caller_qn);
+    dst.callee_qn = cbm_arena_strdup(dst_arena, callee_qn);
+    dst.strategy = strategy ? cbm_arena_strdup(dst_arena, strategy) : NULL;
+    dst.confidence = confidence;
+    dst.reason = reason ? cbm_arena_strdup(dst_arena, reason) : NULL;
+    cbm_resolvedcall_push(dst_calls, dst_arena, dst);
 }
 
 /* Append cross-file results from `src_out` (allocated in a scratch arena
@@ -338,19 +363,415 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         if (k) {
             cbm_ht_set(seen, k, (void *)1);
         }
-        CBMResolvedCall dst;
-        memset(&dst, 0, sizeof(dst));
-        dst.caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
-        dst.callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
-        dst.strategy = src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
-        dst.confidence = src->confidence;
-        dst.reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-        cbm_resolvedcall_push(dst_calls, dst_arena, dst);
+        pxc_append_result_fields(dst_arena, dst_calls, src->caller_qn, src->callee_qn,
+                                 src->strategy, src->confidence, src->reason);
     }
 
     cbm_ht_free(seen);
     cbm_arena_destroy(&keys);
 }
+
+#ifdef HAVE_RUST_ANALYZER_LSP
+
+typedef struct {
+    char *root;
+    int *indices;
+    int count;
+    int cap;
+} pxc_rust_workspace_t;
+
+static char *pxc_strdup_heap(const char *s) {
+    if (!s)
+        return NULL;
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, s, n + 1);
+    return out;
+}
+
+static char *pxc_strndup_heap(const char *s, size_t n) {
+    char *out = (char *)malloc(n + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+static char *pxc_dirname_heap(const char *path) {
+    if (!path)
+        return NULL;
+    const char *slash = strrchr(path, '/');
+    if (!slash)
+        return pxc_strdup_heap(".");
+    if (slash == path)
+        return pxc_strdup_heap("/");
+    return pxc_strndup_heap(path, (size_t)(slash - path));
+}
+
+static char *pxc_parent_dir_heap(const char *dir) {
+    if (!dir || strcmp(dir, "/") == 0)
+        return NULL;
+    const char *slash = strrchr(dir, '/');
+    if (!slash)
+        return NULL;
+    if (slash == dir)
+        return pxc_strdup_heap("/");
+    return pxc_strndup_heap(dir, (size_t)(slash - dir));
+}
+
+static char *pxc_path_join_heap(const char *dir, const char *base) {
+    if (!dir || !base)
+        return NULL;
+    size_t dn = strlen(dir);
+    size_t bn = strlen(base);
+    bool need_slash = (dn > 0 && dir[dn - 1] != '/');
+    char *out = (char *)malloc(dn + (need_slash ? 1u : 0u) + bn + 1u);
+    if (!out)
+        return NULL;
+    memcpy(out, dir, dn);
+    size_t off = dn;
+    if (need_slash)
+        out[off++] = '/';
+    memcpy(out + off, base, bn + 1u);
+    return out;
+}
+
+static bool pxc_file_exists(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool pxc_cargo_manifest_has_workspace(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    char buf[65537];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    (void)fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, "[workspace]") != NULL;
+}
+
+static char *pxc_find_rust_workspace_root(const char *repo_path, const char *file_path) {
+    char *dir = pxc_dirname_heap(file_path);
+    char *nearest_cargo = NULL;
+    char *workspace = NULL;
+    while (dir) {
+        char *manifest = pxc_path_join_heap(dir, "Cargo.toml");
+        if (manifest && pxc_file_exists(manifest)) {
+            if (!nearest_cargo)
+                nearest_cargo = pxc_strdup_heap(dir);
+            if (pxc_cargo_manifest_has_workspace(manifest)) {
+                free(workspace);
+                workspace = pxc_strdup_heap(dir);
+            }
+        }
+        free(manifest);
+        char *parent = pxc_parent_dir_heap(dir);
+        if (!parent || strcmp(parent, dir) == 0) {
+            free(parent);
+            break;
+        }
+        free(dir);
+        dir = parent;
+    }
+    free(dir);
+    if (workspace) {
+        free(nearest_cargo);
+        return workspace;
+    }
+    if (nearest_cargo)
+        return nearest_cargo;
+    return pxc_strdup_heap(repo_path);
+}
+
+static char *pxc_relative_path_heap(const char *root, const char *path) {
+    if (!root || !path)
+        return NULL;
+    size_t rn = strlen(root);
+    if (strncmp(root, path, rn) != 0)
+        return NULL;
+    const char *rel = path + rn;
+    if (*rel == '/')
+        rel++;
+    else if (*rel != '\0')
+        return NULL;
+    return pxc_strdup_heap(rel);
+}
+
+static bool pxc_rust_def_label(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
+}
+
+static int pxc_rust_workspace_push(pxc_rust_workspace_t *ws, int idx) {
+    if (ws->count >= ws->cap) {
+        int new_cap = ws->cap ? ws->cap * 2 : 8;
+        int *new_indices = (int *)realloc(ws->indices, (size_t)new_cap * sizeof(int));
+        if (!new_indices)
+            return -1;
+        ws->indices = new_indices;
+        ws->cap = new_cap;
+    }
+    ws->indices[ws->count++] = idx;
+    return 0;
+}
+
+static CBMFileResult *pxc_rust_find_owner_by_caller(const pxc_rust_workspace_t *ws,
+                                                    CBMFileResult **cache,
+                                                    const char *caller_qn) {
+    if (!ws || !cache || !caller_qn)
+        return NULL;
+    for (int i = 0; i < ws->count; i++) {
+        CBMFileResult *r = cache[ws->indices[i]];
+        if (!r)
+            continue;
+        for (int c = 0; c < r->calls.count; c++) {
+            const char *enclosing = r->calls.items[c].enclosing_func_qn;
+            if (enclosing && strcmp(enclosing, caller_qn) == 0)
+                return r;
+        }
+    }
+    return NULL;
+}
+
+static void pxc_free_rust_workspaces(pxc_rust_workspace_t *workspaces, int count) {
+    if (!workspaces)
+        return;
+    for (int i = 0; i < count; i++) {
+        free(workspaces[i].root);
+        free(workspaces[i].indices);
+    }
+    free(workspaces);
+}
+
+static int pxc_run_one_rust_workspace(const pxc_rust_workspace_t *ws, const cbm_file_info_t *files,
+                                      CBMFileResult **cache) {
+    int def_site_count = 0;
+    int ra_file_count = 0;
+    for (int wi = 0; wi < ws->count; wi++) {
+        int fi = ws->indices[wi];
+        CBMFileResult *r = cache[fi];
+        if (!r)
+            continue;
+        for (int di = 0; di < r->defs.count; di++) {
+            const CBMDefinition *d = &r->defs.items[di];
+            if (pxc_rust_def_label(d->label) && d->qualified_name && d->start_line > 0 &&
+                d->end_line >= d->start_line) {
+                def_site_count++;
+            }
+        }
+        if (r->source && r->source_len > 0 && r->calls.count > 0)
+            ra_file_count++;
+    }
+    if (def_site_count == 0 || ra_file_count == 0)
+        return 0;
+
+    RustAnalyzerDefSite *def_sites =
+        (RustAnalyzerDefSite *)calloc((size_t)def_site_count, sizeof(RustAnalyzerDefSite));
+    RustAnalyzerFile *ra_files =
+        (RustAnalyzerFile *)calloc((size_t)ra_file_count, sizeof(RustAnalyzerFile));
+    char **def_rel_paths = (char **)calloc((size_t)def_site_count, sizeof(char *));
+    char **file_rel_paths = (char **)calloc((size_t)ra_file_count, sizeof(char *));
+    RustAnalyzerCall **call_arrays =
+        (RustAnalyzerCall **)calloc((size_t)ra_file_count, sizeof(RustAnalyzerCall *));
+    RustAnalyzerImport **import_arrays =
+        (RustAnalyzerImport **)calloc((size_t)ra_file_count, sizeof(RustAnalyzerImport *));
+    if (!def_sites || !ra_files || !def_rel_paths || !file_rel_paths || !call_arrays ||
+        !import_arrays) {
+        free(def_sites);
+        free(ra_files);
+        free(def_rel_paths);
+        free(file_rel_paths);
+        free(call_arrays);
+        free(import_arrays);
+        return -1;
+    }
+
+    int dn = 0;
+    int fn = 0;
+    for (int wi = 0; wi < ws->count; wi++) {
+        int fi = ws->indices[wi];
+        CBMFileResult *r = cache[fi];
+        if (!r)
+            continue;
+        for (int di = 0; di < r->defs.count; di++) {
+            const CBMDefinition *d = &r->defs.items[di];
+            if (!pxc_rust_def_label(d->label) || !d->qualified_name || d->start_line == 0 ||
+                d->end_line < d->start_line) {
+                continue;
+            }
+            char *rel = pxc_relative_path_heap(ws->root, files[fi].path);
+            if (!rel)
+                continue;
+            def_rel_paths[dn] = rel;
+            def_sites[dn].qualified_name = d->qualified_name;
+            def_sites[dn].rel_path = rel;
+            def_sites[dn].start_line = d->start_line;
+            def_sites[dn].end_line = d->end_line;
+            dn++;
+        }
+        if (!r->source || r->source_len <= 0 || r->calls.count <= 0)
+            continue;
+        char *rel = pxc_relative_path_heap(ws->root, files[fi].path);
+        if (!rel)
+            continue;
+        RustAnalyzerCall *calls =
+            (RustAnalyzerCall *)calloc((size_t)r->calls.count, sizeof(RustAnalyzerCall));
+        RustAnalyzerImport *imports = NULL;
+        if (r->imports.count > 0) {
+            imports = (RustAnalyzerImport *)calloc((size_t)r->imports.count,
+                                                   sizeof(RustAnalyzerImport));
+        }
+        if (!calls || (r->imports.count > 0 && !imports)) {
+            free(rel);
+            free(calls);
+            free(imports);
+            continue;
+        }
+        for (int ci = 0; ci < r->calls.count; ci++) {
+            calls[ci].callee_name = r->calls.items[ci].callee_name;
+            calls[ci].enclosing_func_qn = r->calls.items[ci].enclosing_func_qn;
+        }
+        for (int ii = 0; ii < r->imports.count; ii++) {
+            imports[ii].local_name = r->imports.items[ii].local_name;
+            imports[ii].module_path = r->imports.items[ii].module_path;
+        }
+        file_rel_paths[fn] = rel;
+        call_arrays[fn] = calls;
+        import_arrays[fn] = imports;
+        ra_files[fn].source = r->source;
+        ra_files[fn].source_len = r->source_len;
+        ra_files[fn].rel_path = rel;
+        ra_files[fn].module_qn = r->module_qn;
+        ra_files[fn].calls = calls;
+        ra_files[fn].call_count = r->calls.count;
+        ra_files[fn].imports = imports;
+        ra_files[fn].import_count = r->imports.count;
+        fn++;
+    }
+
+    if (dn == 0 || fn == 0) {
+        for (int i = 0; i < dn; i++)
+            free(def_rel_paths[i]);
+        for (int i = 0; i < fn; i++) {
+            free(file_rel_paths[i]);
+            free(call_arrays[i]);
+            free(import_arrays[i]);
+        }
+        free(def_sites);
+        free(ra_files);
+        free(def_rel_paths);
+        free(file_rel_paths);
+        free(call_arrays);
+        free(import_arrays);
+        return 0;
+    }
+
+    RustAnalyzerResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    RustAnalyzerStatus status =
+        rust_analyzer_resolve_batch(ws->root, def_sites, dn, ra_files, fn, &out);
+    if (status == RUST_ANALYZER_OK) {
+        for (int i = 0; i < out.count; i++) {
+            RustAnalyzerResolvedCall *edge = &out.items[i];
+            CBMFileResult *owner = pxc_rust_find_owner_by_caller(ws, cache, edge->caller_qn);
+            if (!owner)
+                continue;
+            pxc_append_result_fields(&owner->arena, &owner->resolved_calls, edge->caller_qn,
+                                     edge->callee_qn, edge->strategy, edge->confidence,
+                                     edge->reason);
+        }
+    }
+    rust_analyzer_free_resolved_call_array(&out);
+
+    for (int i = 0; i < dn; i++)
+        free(def_rel_paths[i]);
+    for (int i = 0; i < fn; i++) {
+        free(file_rel_paths[i]);
+        free(call_arrays[i]);
+        free(import_arrays[i]);
+    }
+    free(def_sites);
+    free(ra_files);
+    free(def_rel_paths);
+    free(file_rel_paths);
+    free(call_arrays);
+    free(import_arrays);
+    return status == RUST_ANALYZER_OK ? 0 : -1;
+}
+
+int cbm_pxc_run_rust_analyzer_batch(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                    int file_count, CBMFileResult **cache) {
+    if (!ctx || !files || file_count <= 0 || !cache)
+        return 0;
+
+    pxc_rust_workspace_t *workspaces = NULL;
+    int ws_count = 0;
+    int ws_cap = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language != CBM_LANG_RUST || !cache[i])
+            continue;
+        char *root = pxc_find_rust_workspace_root(ctx->repo_path, files[i].path);
+        if (!root)
+            continue;
+        int found = -1;
+        for (int w = 0; w < ws_count; w++) {
+            if (strcmp(workspaces[w].root, root) == 0) {
+                found = w;
+                break;
+            }
+        }
+        if (found < 0) {
+            if (ws_count >= ws_cap) {
+                int new_cap = ws_cap ? ws_cap * 2 : 4;
+                pxc_rust_workspace_t *new_workspaces = (pxc_rust_workspace_t *)realloc(
+                    workspaces, (size_t)new_cap * sizeof(pxc_rust_workspace_t));
+                if (!new_workspaces) {
+                    free(root);
+                    pxc_free_rust_workspaces(workspaces, ws_count);
+                    return -1;
+                }
+                workspaces = new_workspaces;
+                memset(&workspaces[ws_cap], 0,
+                       (size_t)(new_cap - ws_cap) * sizeof(pxc_rust_workspace_t));
+                ws_cap = new_cap;
+            }
+            found = ws_count++;
+            workspaces[found].root = root;
+            root = NULL;
+        }
+        if (pxc_rust_workspace_push(&workspaces[found], i) != 0) {
+            free(root);
+            pxc_free_rust_workspaces(workspaces, ws_count);
+            return -1;
+        }
+        free(root);
+    }
+
+    int rc = 0;
+    for (int w = 0; w < ws_count; w++) {
+        if (pxc_run_one_rust_workspace(&workspaces[w], files, cache) != 0)
+            rc = -1;
+    }
+    pxc_free_rust_workspaces(workspaces, ws_count);
+    return rc;
+}
+
+#else
+
+int cbm_pxc_run_rust_analyzer_batch(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                    int file_count, CBMFileResult **cache) {
+    (void)ctx;
+    (void)files;
+    (void)file_count;
+    (void)cache;
+    return 0;
+}
+
+#endif
 
 /* Run cross-file LSP for a single file inside a scratch arena that gets
  * freed when the call returns. The LSP would otherwise allocate a fresh
@@ -401,6 +822,10 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     case CBM_LANG_KOTLIN:
         cbm_run_kotlin_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count,
                                  imp_names, imp_qns, imp_count, tree, &out);
+        break;
+    case CBM_LANG_RUST:
+        cbm_run_rust_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
+                               imp_qns, imp_count, tree, &out);
         break;
     default:
         break;
