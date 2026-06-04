@@ -773,6 +773,27 @@ int cbm_pxc_run_rust_analyzer_batch(cbm_pipeline_ctx_t *ctx, const cbm_file_info
 
 #endif
 
+static CBMRustLSPDef *pxc_build_rust_defs(CBMArena *arena, const CBMLSPDef *defs, int def_count) {
+    if (!arena || !defs || def_count <= 0)
+        return NULL;
+    CBMRustLSPDef *rust_defs =
+        (CBMRustLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(CBMRustLSPDef));
+    if (!rust_defs)
+        return NULL;
+    memset(rust_defs, 0, (size_t)def_count * sizeof(CBMRustLSPDef));
+    for (int i = 0; i < def_count; i++) {
+        rust_defs[i].qualified_name = defs[i].qualified_name;
+        rust_defs[i].short_name = defs[i].short_name;
+        rust_defs[i].label = defs[i].label;
+        rust_defs[i].receiver_type = defs[i].receiver_type;
+        rust_defs[i].def_module_qn = defs[i].def_module_qn;
+        rust_defs[i].return_types = defs[i].return_types;
+        rust_defs[i].embedded_types = defs[i].embedded_types;
+        rust_defs[i].is_interface = defs[i].is_interface;
+    }
+    return rust_defs;
+}
+
 /* Run cross-file LSP for a single file inside a scratch arena that gets
  * freed when the call returns. The LSP would otherwise allocate a fresh
  * type registry + stdlib + all project defs into the supplied arena, and
@@ -823,10 +844,12 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         cbm_run_kotlin_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count,
                                  imp_names, imp_qns, imp_count, tree, &out);
         break;
-    case CBM_LANG_RUST:
-        cbm_run_rust_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                               imp_qns, imp_count, tree, &out);
+    case CBM_LANG_RUST: {
+        CBMRustLSPDef *rust_defs = pxc_build_rust_defs(&scratch, defs, def_count);
+        cbm_run_rust_lsp_cross(&scratch, source, source_len, module_qn, rust_defs, def_count,
+                               imp_names, imp_qns, imp_count, tree, &out);
         break;
+    }
     default:
         break;
     }
