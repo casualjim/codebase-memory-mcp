@@ -1,12 +1,13 @@
 /*
  * pass_githistory.c — Analyze git log to find change coupling.
  *
- * Runs `git log --name-only --since=6 months ago` and computes
+ * Runs `git log --name-only --since=1 year ago` and computes
  * file pairs that change together frequently. Creates FILE_CHANGES_WITH
  * edges between File nodes with coupling_score properties.
  *
- * Skips commits with >20 files (refactoring/merge noise).
- * Requires minimum 3 co-changes for an edge.
+ * Native-default mode skips commits with >20 files and requires minimum
+ * 3 co-changes. Crumbs topology-cochange mode keeps single observations
+ * and weights broad commits instead of silently discarding them.
  *
  * Depends on: pass_structure having created File nodes
  */
@@ -28,6 +29,8 @@ enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_M
 /* Minimum coupling score to create an edge */
 #define MIN_COUPLING_SCORE 0.3
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,8 +108,6 @@ static void commit_free(commit_t *c) {
     free(c->files);
 }
 
-/* ── git log parsing (popen "git log") ────────────────────────────── */
-
 static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) {
     *out = NULL;
     *out_count = 0;
@@ -182,11 +183,19 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
         commit_free(&current);
     }
 
-    cbm_pclose(fp);
+    int close_rc = cbm_pclose(fp);
+    if (close_rc != 0) {
+        for (int i = 0; i < count; i++) {
+            commit_free(&commits[i]);
+        }
+        free(commits);
+        return CBM_NOT_FOUND;
+    }
     *out = commits;
     *out_count = count;
     return 0;
 }
+
 
 /* Callback to free hash table entries. */
 static void free_counter(const char *key, void *val, void *ud) {
@@ -199,8 +208,15 @@ static void free_counter(const char *key, void *val, void *ud) {
 
 /* Context for collect_coupling_result callback. */
 typedef struct {
+    cbm_history_behavior_t behavior;
+    const CBMHashTable *file_scope;
+} coupling_options_t;
+
+typedef struct {
     CBMHashTable *file_counts;
     CBMHashTable *pair_timestamps; /* pair_key → long long*: max commit ts */
+    CBMHashTable *pair_weights;    /* pair_key → double*: broad-commit weighted evidence */
+    cbm_history_behavior_t behavior;
     cbm_change_coupling_t *out;
     int out_count;
     int max_out;
@@ -209,7 +225,7 @@ typedef struct {
 static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
     collect_coupling_ctx_t *cctx = ud;
     int co_count = *(int *)val;
-    if (co_count < GH_MIN_COMMITS) {
+    if (cctx->behavior == CBM_HISTORY_NATIVE_DEFAULT && co_count < GH_MIN_COMMITS) {
         return;
     }
     if (cctx->out_count >= cctx->max_out) {
@@ -242,7 +258,10 @@ static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
     }
 
     double score = (double)co_count / (double)min_total;
-    if (score < MIN_COUPLING_SCORE) {
+    if (cctx->behavior == CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE) {
+        double *weighted = cbm_ht_get(cctx->pair_weights, pair_key);
+        score = weighted ? *weighted : (double)co_count;
+    } else if (score < MIN_COUPLING_SCORE) {
         return;
     }
 
@@ -255,21 +274,77 @@ static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
     cc->last_co_change = ts ? *ts : 0;
 }
 
-int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
-                                cbm_change_coupling_t *out, int max_out) {
+static bool coupling_accept_file(const coupling_options_t *options, const char *path) {
+    if (!options || options->behavior != CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE || !options->file_scope) {
+        return true;
+    }
+    return cbm_ht_get((CBMHashTable *)options->file_scope, path) != NULL;
+}
+
+static int cbm_compute_change_coupling_with_options(const cbm_commit_files_t *commits,
+                                                    int commit_count,
+                                                    cbm_change_coupling_t *out,
+                                                    int max_out,
+                                                    const coupling_options_t *options,
+                                                    cbm_githistory_result_t *result) {
     CBMHashTable *file_counts = cbm_ht_create(CBM_SZ_1K);
     CBMHashTable *pair_counts = cbm_ht_create(CBM_SZ_2K);
+    CBMHashTable *pair_weights = cbm_ht_create(CBM_SZ_2K);
+    cbm_history_behavior_t behavior = options ? options->behavior : CBM_HISTORY_NATIVE_DEFAULT;
     /* Parallel table mapping pair_key → max commit timestamp seen for that
      * pair, so the resulting edge can carry last_co_change. The pair_counts
      * table consumes its key on insert; pair_timestamps gets its own copy. */
     CBMHashTable *pair_timestamps = cbm_ht_create(CBM_SZ_2K);
 
     for (int c = 0; c < commit_count; c++) {
-        if (commits[c].count > GH_MAX_FILES) {
+        if (behavior == CBM_HISTORY_NATIVE_DEFAULT && commits[c].count > GH_MAX_FILES) {
             continue;
         }
 
+        int accepted_count = 0;
         for (int i = 0; i < commits[c].count; i++) {
+            if (coupling_accept_file(options, commits[c].files[i])) {
+                accepted_count++;
+            }
+        }
+        if (accepted_count < PAIR_LEN) {
+            continue;
+        }
+        if (result && accepted_count > result->max_accepted_file_count) {
+            result->max_accepted_file_count = accepted_count;
+        }
+        if (behavior == CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE) {
+            uint64_t existing_pairs = (uint64_t)cbm_ht_count(pair_counts);
+            uint64_t candidate_pairs = ((uint64_t)accepted_count * (uint64_t)(accepted_count - SKIP_ONE)) / 2ULL;
+            uint64_t upper_bound = existing_pairs + candidate_pairs;
+            if (result) {
+                result->candidate_coupling_count =
+                    upper_bound > (uint64_t)INT_MAX ? INT_MAX : (int)upper_bound;
+                result->max_couplings = max_out;
+            }
+            if (candidate_pairs > (uint64_t)max_out || upper_bound > (uint64_t)max_out) {
+                if (result) {
+                    result->resource_limit_exceeded = true;
+                }
+                cbm_ht_foreach(pair_counts, free_counter, NULL);
+                cbm_ht_free(pair_counts);
+                cbm_ht_foreach(pair_timestamps, free_counter, NULL);
+                cbm_ht_free(pair_timestamps);
+                cbm_ht_foreach(pair_weights, free_counter, NULL);
+                cbm_ht_free(pair_weights);
+                cbm_ht_foreach(file_counts, free_counter, NULL);
+                cbm_ht_free(file_counts);
+                return CBM_NOT_FOUND;
+            }
+        }
+        double pair_weight = behavior == CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE
+                                 ? 1.0 / (double)(accepted_count - SKIP_ONE)
+                                 : 1.0;
+
+        for (int i = 0; i < commits[c].count; i++) {
+            if (!coupling_accept_file(options, commits[c].files[i])) {
+                continue;
+            }
             int *val = cbm_ht_get(file_counts, commits[c].files[i]);
             if (val) {
                 (*val)++;
@@ -281,7 +356,13 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
         }
 
         for (int i = 0; i < commits[c].count; i++) {
+            if (!coupling_accept_file(options, commits[c].files[i])) {
+                continue;
+            }
             for (int j = i + SKIP_ONE; j < commits[c].count; j++) {
+                if (!coupling_accept_file(options, commits[c].files[j])) {
+                    continue;
+                }
                 const char *a = commits[c].files[i];
                 const char *b = commits[c].files[j];
                 if (strcmp(a, b) > 0) {
@@ -300,6 +381,10 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
                 int *val = cbm_ht_get(pair_counts, pk);
                 if (val) {
                     (*val)++;
+                    double *weight = cbm_ht_get(pair_weights, pk);
+                    if (weight) {
+                        *weight += pair_weight;
+                    }
                     long long *ts = cbm_ht_get(pair_timestamps, pk);
                     if (ts && commits[c].timestamp > *ts) {
                         *ts = commits[c].timestamp;
@@ -316,14 +401,27 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
                     long long *nts = malloc(sizeof(long long));
                     *nts = commits[c].timestamp;
                     cbm_ht_set(pair_timestamps, pk2, nts);
+                    char *pk3 = malloc(pk_len);
+                    memcpy(pk3, pk2, pk_len);
+                    double *nw = malloc(sizeof(double));
+                    *nw = pair_weight;
+                    cbm_ht_set(pair_weights, pk3, nw);
                 }
             }
         }
     }
 
+    uint32_t pair_count = cbm_ht_count(pair_counts);
+    if (result) {
+        result->candidate_coupling_count = (int)pair_count;
+        result->max_couplings = max_out;
+    }
+
     collect_coupling_ctx_t cctx = {
         .file_counts = file_counts,
         .pair_timestamps = pair_timestamps,
+        .pair_weights = pair_weights,
+        .behavior = behavior,
         .out = out,
         .out_count = 0,
         .max_out = max_out,
@@ -334,31 +432,61 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
     cbm_ht_free(pair_counts);
     cbm_ht_foreach(pair_timestamps, free_counter, NULL);
     cbm_ht_free(pair_timestamps);
+    cbm_ht_foreach(pair_weights, free_counter, NULL);
+    cbm_ht_free(pair_weights);
     cbm_ht_foreach(file_counts, free_counter, NULL);
     cbm_ht_free(file_counts);
 
     return cctx.out_count;
 }
 
+int cbm_compute_change_coupling_for_behavior(const cbm_commit_files_t *commits,
+                                             int commit_count,
+                                             cbm_change_coupling_t *out,
+                                             int max_out,
+                                             cbm_history_behavior_t behavior,
+                                             const CBMHashTable *file_scope) {
+    coupling_options_t options = {.behavior = behavior, .file_scope = file_scope};
+    return cbm_compute_change_coupling_with_options(commits, commit_count, out, max_out,
+                                                    &options, NULL);
+}
+
+int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
+                                cbm_change_coupling_t *out, int max_out) {
+    return cbm_compute_change_coupling_for_behavior(commits, commit_count, out, max_out,
+                                                    CBM_HISTORY_NATIVE_DEFAULT, NULL);
+}
+
 /* ── Split pass: compute (I/O-bound) + apply (gbuf writes) ───────── */
 
 /* Pre-computed coupling result buffer for fused post-pass parallelism. */
-#define MAX_COUPLINGS 8192
+#define MAX_COUPLINGS 65536
 #define MAX_FILE_TEMPORAL 16384
 
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
-int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result) {
+int cbm_pipeline_githistory_compute_for_behavior(const char *repo_path,
+                                                  cbm_githistory_result_t *result,
+                                                  cbm_history_behavior_t behavior,
+                                                  const CBMHashTable *file_scope) {
     result->couplings = NULL;
     result->count = 0;
     result->commit_count = 0;
+    result->resource_limit_exceeded = false;
+    result->candidate_coupling_count = 0;
+    result->max_couplings = 0;
+    result->max_accepted_file_count = 0;
     result->file_temporal = NULL;
     result->file_temporal_count = 0;
 
     commit_t *commits = NULL;
     int commit_count = 0;
     int rc = parse_git_log(repo_path, &commits, &commit_count);
-    if (rc != 0 || commit_count == 0) {
+    if (rc != 0) {
+        free(commits);
+        return rc;
+    }
+    if (commit_count == 0) {
         free(commits);
         return 0;
     }
@@ -381,7 +509,10 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     }
 
     cbm_change_coupling_t *couplings = malloc(MAX_COUPLINGS * sizeof(cbm_change_coupling_t));
-    int coupling_count = cbm_compute_change_coupling(cf, commit_count, couplings, MAX_COUPLINGS);
+    coupling_options_t options = {.behavior = behavior, .file_scope = file_scope};
+    int coupling_count = cbm_compute_change_coupling_with_options(cf, commit_count, couplings,
+                                                                  MAX_COUPLINGS, &options,
+                                                                  result);
 
     /* Per-file temporal aggregation: change_count + last_modified.
      * Single hash-table pass over the same commit set used for coupling so
@@ -392,11 +523,14 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
         int ft_count = 0;
         CBMHashTable *file_idx = cbm_ht_create(CBM_SZ_1K);
         for (int c = 0; c < commit_count; c++) {
-            if (cf[c].count > GH_MAX_FILES) {
+            if (behavior == CBM_HISTORY_NATIVE_DEFAULT && cf[c].count > GH_MAX_FILES) {
                 continue;
             }
             for (int f = 0; f < cf[c].count; f++) {
                 const char *fp = cf[c].files[f];
+                if (!coupling_accept_file(&options, fp)) {
+                    continue;
+                }
                 int *idx = cbm_ht_get(file_idx, fp);
                 if (idx) {
                     ft_arr[*idx].change_count++;
@@ -429,7 +563,12 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
 
     result->couplings = couplings;
     result->count = coupling_count;
-    return 0;
+    return coupling_count >= 0 ? 0 : CBM_NOT_FOUND;
+}
+
+int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result) {
+    return cbm_pipeline_githistory_compute_for_behavior(repo_path, result,
+                                                        CBM_HISTORY_NATIVE_DEFAULT, NULL);
 }
 
 /* Apply pre-computed couplings to the graph buffer (must be on main thread). */

@@ -24,6 +24,7 @@
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
+typedef struct cbm_crumbs_context cbm_crumbs_context_t;
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -43,14 +44,36 @@ typedef enum {
 } cbm_index_mode_t;
 #endif
 
+/* ── History behavior ───────────────────────────────────────────── */
+
+typedef enum {
+    CBM_HISTORY_NATIVE_DEFAULT = 0,
+    CBM_HISTORY_DISABLED = 1,
+    CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE = 2,
+} cbm_history_behavior_t;
+
 /* ── Pipeline lifecycle ─────────────────────────────────────────── */
 
 /* Create a new pipeline. Caller owns the result. */
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm_index_mode_t mode);
 
+/* Create a pipeline using explicit Crumbs context path/config resolution. */
+cbm_pipeline_t *cbm_pipeline_new_with_crumbs_context(const char *repo_path,
+                                                     cbm_crumbs_context_t *ctx,
+                                                     cbm_index_mode_t mode);
+
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
+
+/* Configure git-history/cochange indexing behavior. Returns 0 on success. */
+int cbm_pipeline_set_history_behavior(cbm_pipeline_t *p, cbm_history_behavior_t behavior);
+
+/* Return the configured git-history/cochange indexing behavior. */
+int cbm_pipeline_get_history_behavior(const cbm_pipeline_t *p);
+
+/* Borrow the last pipeline error message, if any. */
+const char *cbm_pipeline_last_error(const cbm_pipeline_t *p);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);

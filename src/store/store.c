@@ -662,6 +662,11 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
     }
 
     int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
+    /* Honor SQLite's ":memory:" sentinel: without this, cbm_path_for_file_api +
+     * SQLITE_OPEN_CREATE materializes ":memory:" as a literal on-disk file. */
+    if (path && strcmp(path, ":memory:") == 0) {
+        in_memory = true;
+    }
     if (in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }

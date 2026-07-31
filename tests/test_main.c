@@ -691,6 +691,7 @@ extern void suite_httpd(void);
 extern void suite_security(void);
 extern void suite_yaml(void);
 extern void suite_integration(void);
+extern void suite_crumbs_pipeline(void);
 extern void suite_lang_contract(void);
 extern void suite_edge_imports(void);
 extern void suite_edge_structural(void);
@@ -985,6 +986,7 @@ int main(int argc, char **argv) {
 
     /* Integration (end-to-end) */
     RUN_SELECTED_SUITE(integration);
+    RUN_SELECTED_SUITE(crumbs_pipeline);
 
     /* Per-language graph contracts (node/edge types, attribution, no-crash) */
     RUN_SELECTED_SUITE(lang_contract);

@@ -1154,6 +1154,18 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     } else {
         snprintf(gi_path, sizeof(gi_path), "%s/.cbmignore", repo_path);
         cbmignore = cbm_gitignore_load(gi_path);
+        /* Crumbs exposes .crumbsignore as its user-facing ignore filename; honor it
+         * alongside .cbmignore so one file excludes from both doc and graph indexes. */
+        snprintf(gi_path, sizeof(gi_path), "%s/.crumbsignore", repo_path);
+        cbm_gitignore_t *crumbs_gi = cbm_gitignore_load(gi_path);
+        if (crumbs_gi) {
+            if (cbmignore) {
+                cbm_gitignore_merge(cbmignore, crumbs_gi);
+                cbm_gitignore_free(crumbs_gi);
+            } else {
+                cbmignore = crumbs_gi;
+            }
+        }
     }
 
     /* Walk */

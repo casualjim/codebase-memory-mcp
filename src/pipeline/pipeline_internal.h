@@ -89,6 +89,7 @@ typedef struct {
                                * don't record; cbm_pipeline_add_file_error is
                                * NULL-safe. */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
+    cbm_history_behavior_t history_behavior;
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
@@ -253,6 +254,12 @@ typedef struct {
  * Caller owns out[]. */
 int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
                                 cbm_change_coupling_t *out, int max_out);
+int cbm_compute_change_coupling_for_behavior(const cbm_commit_files_t *commits,
+                                             int commit_count,
+                                             cbm_change_coupling_t *out,
+                                             int max_out,
+                                             cbm_history_behavior_t behavior,
+                                             const CBMHashTable *file_scope);
 
 /* Go-style implicit interface satisfaction on graph buffer.
  * Finds Interface nodes, matches method sets against Class nodes,
@@ -578,6 +585,11 @@ typedef struct {
     cbm_change_coupling_t *couplings;
     int count;
     int commit_count;
+    /* Explicit resource-guard metadata for Crumbs topology cochange mode. */
+    bool resource_limit_exceeded;
+    int candidate_coupling_count;
+    int max_couplings;
+    int max_accepted_file_count;
     /* Per-file temporal data (change_count + last_modified) for File nodes.
      * NULL when the history pass had no commits to analyse. */
     cbm_file_temporal_t *file_temporal;
@@ -587,6 +599,10 @@ typedef struct {
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
 int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result);
+int cbm_pipeline_githistory_compute_for_behavior(const char *repo_path,
+                                                 cbm_githistory_result_t *result,
+                                                 cbm_history_behavior_t behavior,
+                                                 const CBMHashTable *file_scope);
 
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);

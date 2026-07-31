@@ -15,6 +15,7 @@
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
+#include "crumbs/cbm_context.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -82,6 +83,9 @@ struct cbm_pipeline {
     cbm_git_context_t git_ctx;
     char *branch_qn;
     cbm_index_mode_t mode;
+    cbm_crumbs_context_t *crumbs_context;
+    cbm_history_behavior_t history_behavior;
+    const char *last_error; /* static message set when configuration is rejected */
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
@@ -189,6 +193,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
+    p->history_behavior = CBM_HISTORY_NATIVE_DEFAULT;
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
@@ -202,6 +207,52 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
     }
+}
+
+cbm_pipeline_t *cbm_pipeline_new_with_crumbs_context(const char *repo_path,
+                                                     cbm_crumbs_context_t *ctx,
+                                                     cbm_index_mode_t mode) {
+    if (!repo_path || !ctx) {
+        return NULL;
+    }
+    char *project_name = cbm_project_name_from_path(repo_path);
+    if (!project_name) {
+        return NULL;
+    }
+    char db_path[CBM_SZ_1K];
+    if (cbm_crumbs_context_project_db_path(ctx, project_name, db_path, (int)sizeof(db_path)) != 0) {
+        free(project_name);
+        return NULL;
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, db_path, mode);
+    free(project_name);
+    if (p && cbm_crumbs_context_uses_memory_database(ctx)) {
+        p->crumbs_context = ctx;
+    }
+    return p;
+}
+
+int cbm_pipeline_set_history_behavior(cbm_pipeline_t *p, cbm_history_behavior_t behavior) {
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    if (behavior < CBM_HISTORY_NATIVE_DEFAULT || behavior > CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE) {
+        return CBM_NOT_FOUND;
+    }
+    if (p->mode == CBM_MODE_FAST && behavior == CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE) {
+        p->last_error = "CrumbsTopologyCochange is unsupported in fast mode";
+        return CBM_NOT_FOUND;
+    }
+    p->history_behavior = behavior;
+    return 0;
+}
+
+int cbm_pipeline_get_history_behavior(const cbm_pipeline_t *p) {
+    return p ? (int)p->history_behavior : -1;
+}
+
+const char *cbm_pipeline_last_error(const cbm_pipeline_t *p) {
+    return (p && p->last_error) ? p->last_error : NULL;
 }
 
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
@@ -598,11 +649,14 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
 typedef struct {
     const char *repo_path;
     cbm_githistory_result_t *result;
+    cbm_history_behavior_t behavior;
+    const CBMHashTable *file_scope;
 } gh_compute_arg_t;
 
 static void *gh_compute_thread_fn(void *arg) {
     gh_compute_arg_t *a = arg;
-    cbm_pipeline_githistory_compute(a->repo_path, a->result);
+    cbm_pipeline_githistory_compute_for_behavior(a->repo_path, a->result, a->behavior,
+                                                  a->file_scope);
     return NULL;
 }
 
@@ -1174,7 +1228,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
         cbm_store_free_file_hashes(hashes, hash_count);
         cbm_store_close(check_store);
-        if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
+        if (p->history_behavior != CBM_HISTORY_CRUMBS_TOPOLOGY_COCHANGE &&
+            hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
@@ -1240,34 +1295,48 @@ static const char *pipeline_mode_name(cbm_index_mode_t mode) {
 static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    char *db_path = resolve_db_path(p);
-    if (!db_path) {
-        return CBM_NOT_FOUND;
-    }
-    char *db_dir = strdup(db_path);
-    if (!db_dir) {
-        free(db_path);
-        return CBM_NOT_FOUND;
-    }
-    char *last_slash = strrchr(db_dir, '/');
+    cbm_store_t *borrowed_store = NULL;
+    char *db_path = NULL;
+    if (p->crumbs_context && cbm_crumbs_context_uses_memory_database(p->crumbs_context)) {
+        /* In-memory DB: the context owns a single cbm_store_open_memory() handle. Dumping
+         * via the path would open ":memory:" as a literal file, so flush into the borrowed
+         * store instead and skip the path-based open/close. */
+        borrowed_store = cbm_crumbs_context_memory_store(p->crumbs_context);
+        if (!borrowed_store) {
+            cbm_log_error("pipeline.err", "phase", "dump", "reason", "memory_store_missing");
+            return CBM_NOT_FOUND;
+        }
+    } else {
+        db_path = resolve_db_path(p);
+        if (!db_path) {
+            return CBM_NOT_FOUND;
+        }
+        char *db_dir = strdup(db_path);
+        if (!db_dir) {
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
+        char *last_slash = strrchr(db_dir, '/');
 #ifdef _WIN32
-    char *last_backslash = strrchr(db_dir, '\\');
-    if (last_backslash && (!last_slash || last_backslash > last_slash)) {
-        last_slash = last_backslash;
-    }
+        char *last_backslash = strrchr(db_dir, '\\');
+        if (last_backslash && (!last_slash || last_backslash > last_slash)) {
+            last_slash = last_backslash;
+        }
 #endif
-    if (last_slash) {
-        *last_slash = '\0';
-        cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
+        if (last_slash) {
+            *last_slash = '\0';
+            cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
+        }
+        free(db_dir);
     }
-    free(db_dir);
     /* Capture committed counts BEFORE the dump. cbm_gbuf_dump_to_sqlite calls
      * release_gbuf_indexes(), which frees node_by_qn (graph_buffer.c), after
      * which cbm_gbuf_node_count() returns 0. Reading these post-dump left
      * committed_nodes at 0, so the #334 plausibility gate never fired. */
     p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
     p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
-    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+    int rc = borrowed_store ? cbm_gbuf_flush_to_store(p->gbuf, borrowed_store)
+                            : cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
         free(db_path);
@@ -1277,7 +1346,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     /* Persist-tail spans (phase "persist"): attribute the ~60s that lands here
      * AFTER cbm_gbuf_dump_to_sqlite returns. Active only under CBM_PROFILE. */
     CBM_PROF_START(t_reopen);
-    cbm_store_t *hash_store = cbm_store_open_path(db_path);
+    cbm_store_t *hash_store = borrowed_store ? borrowed_store : cbm_store_open_path(db_path);
     CBM_PROF_END("persist", "1_reopen", t_reopen);
     if (!hash_store) {
         cbm_log_error("pipeline.err", "phase", "persist_open", "path", db_path);
@@ -1431,7 +1500,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
         CBM_PROF_END("persist", "5_fts_backfill", t_fts);
 
-        cbm_store_close(hash_store);
+        if (!borrowed_store) {
+            cbm_store_close(hash_store);
+        }
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     }
     free(p->saved_adr);
@@ -1449,7 +1520,8 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     cbm_githistory_result_t gh_result = {0};
     cbm_thread_t gh_thread;
     bool gh_threaded = false;
-    gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
+    gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result,
+                               .behavior = ctx->history_behavior, .file_scope = NULL};
 
     if (p->mode != CBM_MODE_FAST) {
         if (effective_worker_count(true) > SKIP_ONE) {
@@ -1458,7 +1530,8 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
             }
         }
         if (!gh_threaded) {
-            cbm_pipeline_githistory_compute(ctx->repo_path, &gh_result);
+            cbm_pipeline_githistory_compute_for_behavior(ctx->repo_path, &gh_result,
+                                                         ctx->history_behavior, NULL);
             cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t_gh)));
         }
@@ -1638,6 +1711,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
         .cancelled = p->cancelled,
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
+        .history_behavior = p->history_behavior,
         .path_aliases = path_aliases,
         .excluded_dirs = p->excluded_dirs,
         .excluded_count = p->excluded_count,
@@ -1830,6 +1904,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    /* In-memory DB: the crumbs_context owns a single shared memory_store.
+     * Skip the staging-file + atomic-rename publication flow below, which
+     * derives ":memory:.stage.X" from the db path and treats it as a literal
+     * filesystem file (mkstemp / sqlite3_open / rename never apply SQLite's
+     * ":memory:" sentinel, so they materialize a real file). Run the staged
+     * pipeline directly so the graph lands in the memory_store with no
+     * filesystem side effects. */
+    if (p->crumbs_context && cbm_crumbs_context_uses_memory_database(p->crumbs_context)) {
+        bool was_incremental = false;
+        return cbm_pipeline_run_staged(p, &was_incremental);
+    }
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);
@@ -1866,7 +1951,6 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     int rc = cbm_pipeline_run_staged(p, &was_incremental);
     free(p->db_path);
     p->db_path = configured_db_path;
-
     if (rc != 0 || check_cancel(p) || seal_staging_db(staging_path) != 0) {
         cleanup_staging_db(staging_path);
         free(staging_path);
