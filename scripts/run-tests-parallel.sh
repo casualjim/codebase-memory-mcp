@@ -103,6 +103,17 @@ if [ "$NSUITES" -lt 1 ] || grep -qvE '^[a-z0-9_]+$' "$SUITES_FILE"; then
     exit 1
 fi
 
+# CBM_TEST_EXCLUDE_SUITES="suite1 suite2" drops named suites from this run.
+# Used by integrations that do not exercise specific suites — e.g. Crumbs runs
+# the pipeline in-process and never drives the server/spawn index supervisor,
+# so it excludes `subprocess` (tree-spawn/quiesce supervision that is dead code
+# in that integration and is container-executor-CI sensitive).
+if [ -n "${CBM_TEST_EXCLUDE_SUITES:-}" ]; then
+    EXCLUDE_RE="$(printf '%s\n' $CBM_TEST_EXCLUDE_SUITES | paste -sd'|' -)"
+    grep -vE "^($EXCLUDE_RE)\$" "$SUITES_FILE" > "$SUITES_FILE.tmp" && mv "$SUITES_FILE.tmp" "$SUITES_FILE"
+    NSUITES=$(wc -l < "$SUITES_FILE" | tr -d ' ')
+fi
+
 # CBM_TEST_SHARD="i/N" runs this invocation's deterministic slice of the
 # suite list so CI can spread one platform's suites across N runner jobs.
 # Unset (or "1/1") selects everything — the sharding path is inert unless a
