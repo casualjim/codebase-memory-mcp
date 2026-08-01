@@ -211,10 +211,34 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
     def group_active() -> bool:
         try:
             os.killpg(process.pid, 0)
-            return True
         except ProcessLookupError:
             return False
         except PermissionError:
+            return True
+        # os.killpg(pgid, 0) counts unreaped zombies as active. Under
+        # container executors a non-reaping PID 1 leaves SIGKILLed children
+        # (reparented to init) as zombies, so the check above falsely reports
+        # the group as persisted. Treat a group whose only remaining members
+        # are zombies as gone (Linux /proc).
+        try:
+            pgid = str(process.pid)
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/stat", "rb") as stat_file:
+                        stat = stat_file.read().decode("utf-8", "replace")
+                except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+                    continue
+                fields = stat[stat.rfind(")"):].split()
+                if len(fields) < 5:
+                    continue
+                # Fields after comm: state ppid pgrp ...
+                if fields[3] == pgid and fields[1] != "Z":
+                    return True
+            return False
+        except (FileNotFoundError, OSError):
+            # /proc unavailable (non-Linux): trust the killpg result above.
             return True
 
     def wait_for_group_exit(deadline: float) -> bool:
